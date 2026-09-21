@@ -16,9 +16,9 @@
 ### 一键安装（推荐）
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/your-username/fail2ban-installer/main/install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/violetaini/fail2ban-installer/main/install.sh)
 ```
-*(将 `your-username` 替换为您自己的 GitHub 用户名)*
+*(将 `violetaini` 替换为您自己的 GitHub 用户名)*
 
 ### 自定义参数安装
 
@@ -61,7 +61,7 @@ tail -f /var/log/fail2ban.log
 ## 🗑️ 一键卸载
 
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/your-username/fail2ban-installer/main/uninstall.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/violetaini/fail2ban-installer/main/uninstall.sh)
 ```
 
 ---

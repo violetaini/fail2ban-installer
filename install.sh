@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Fail2Ban Modern One-Key Installer
-# Repo       : https://github.com/your-username/fail2ban-installer
+# Repo       : https://github.com/violetaini/fail2ban-installer
 # Author     : Custom maintained
 # Description: 现代化一键安装与配置 Fail2Ban（免重启、自动检测端口、兼容 Debian/Ubuntu/RHEL/CentOS/Rocky）
 # ==============================================================================
