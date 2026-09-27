@@ -3,7 +3,7 @@
 # Fail2Ban Modern One-Key Installer
 # Repo       : https://github.com/violetaini/fail2ban-installer
 # Author     : Custom maintained
-# Description: 现代化一键安装与配置 Fail2Ban（免重启、交互式确认/自动检测端口、兼容 Debian/Ubuntu/RHEL/CentOS/Rocky）
+# Description: 现代化一键安装与配置 Fail2Ban（先查端口、交互修改SSH端口、自动放行防火墙、免重启启动保护）
 # ==============================================================================
 
 set -euo pipefail
@@ -54,11 +54,11 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "用法: bash install.sh [选项]"
             echo "选项:"
-            echo "  -p, --port <port>         指定 SSH 端口 (跳过交互式询问)"
+            echo "  -p, --port <port>         指定 SSH 端口 (跳过交互询问，若与当前端口不同则自动修改)"
             echo "  -b, --bantime <seconds>   指定封禁时长，单位秒 (默认: 86400)"
             echo "  -m, --maxretry <count>    指定最大尝试次数 (默认: 3)"
             echo "  -w, --whitelist <ips>     指定忽略 IP 白名单，逗号或空格分隔"
-            echo "  -y, --non-interactive     非交互静默安装模式 (使用检测端口或默认参数)"
+            echo "  -y, --non-interactive     非交互静默安装模式 (保持当前端口并使用默认参数)"
             echo "  -h, --help                显示此帮助信息"
             exit 0
             ;;
@@ -79,7 +79,7 @@ echo -e "${CYAN}====================================================${PLAIN}"
 echo -e "${CYAN}           Fail2Ban 现代化高兼容一键安装程序           ${PLAIN}"
 echo -e "${CYAN}====================================================${PLAIN}"
 
-# 2. 自动检测当前 SSH 运行端口 (作为默认推荐值)
+# 2. 自动检测当前本机 SSH 运行端口
 detect_ssh_port() {
     local port=""
     
@@ -119,53 +119,155 @@ detect_ssh_port() {
     echo "$port"
 }
 
-DETECTED_PORT=$(detect_ssh_port)
+# 修改本机 SSH 端口函数
+change_ssh_port() {
+    local target_port="$1"
+    info "正在将系统 SSH 服务端口修改为: $target_port ..."
 
-# 3. 确定 SSH 防护端口 (支持交互式询问与命令行参数)
+    local ssh_cfg="/etc/ssh/sshd_config"
+    if [[ ! -f "$ssh_cfg" ]]; then
+        err "未找到 $ssh_cfg 配置文件，无法自动修改系统 SSH 端口！"
+        return 1
+    fi
+
+    # 1. 备份配置文件
+    local backup_cfg="${ssh_cfg}.bak-$(date +%Y%m%d%H%M%S)"
+    cp "$ssh_cfg" "$backup_cfg"
+    info "已备份原 SSH 配置至: $backup_cfg"
+
+    # 2. 修改配置文件的 Port
+    if grep -qE '^[ \t]*Port[ \t]+[0-9]+' "$ssh_cfg"; then
+        sed -i -E "s/^[ \t]*Port[ \t]+[0-9]+/Port $target_port/" "$ssh_cfg"
+    elif grep -qE '^[ \t]*#?[ \t]*Port[ \t]+' "$ssh_cfg"; then
+        sed -i -E "s/^[ \t]*#?[ \t]*Port[ \t]+[0-9]*/Port $target_port/" "$ssh_cfg"
+    else
+        echo "Port $target_port" >> "$ssh_cfg"
+    fi
+
+    # 3. 语法检测保险机制 (sshd -t)
+    local sshd_bin=""
+    if command -v sshd >/dev/null 2>&1; then
+        sshd_bin="sshd"
+    elif [[ -x "/usr/sbin/sshd" ]]; then
+        sshd_bin="/usr/sbin/sshd"
+    fi
+
+    if [[ -n "$sshd_bin" ]]; then
+        if ! "$sshd_bin" -t 2>/dev/null; then
+            err "sshd 配置语法检查未通过！正在自动回滚配置文件..."
+            cp "$backup_cfg" "$ssh_cfg"
+            err "修改失败，已还原配置。建议您检查 $ssh_cfg 后手动修改。"
+            exit 1
+        fi
+    fi
+
+    # 4. 防火墙自动放行 (UFW / Firewalld)
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qw "active"; then
+        info "检测到 UFW 防火墙处于激活状态，正在放行新端口 $target_port/tcp ..."
+        ufw allow "${target_port}/tcp" >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+        info "检测到 Firewalld 防火墙处于运行状态，正在放行新端口 $target_port/tcp ..."
+        firewall-cmd --permanent --add-port="${target_port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+
+    # 5. 重启 SSH 服务生效
+    info "正在重启 SSH 服务以应用新端口..."
+    local restarted=false
+    if command -v systemctl >/dev/null 2>&1; then
+        for svc in ssh sshd; do
+            if systemctl is-active "$svc" >/dev/null 2>&1 || systemctl is-enabled "$svc" >/dev/null 2>&1; then
+                if systemctl restart "$svc" 2>/dev/null; then
+                    restarted=true
+                    break
+                fi
+            fi
+        done
+        if [[ "$restarted" == "false" ]]; then
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+            restarted=true
+        fi
+    elif command -v service >/dev/null 2>&1; then
+        service ssh restart 2>/dev/null || service sshd restart 2>/dev/null || true
+        restarted=true
+    fi
+
+    echo ""
+    echo -e "${GREEN}================================================================${PLAIN}"
+    ok "系统 SSH 端口已成功更改为: ${CYAN}${target_port}${PLAIN}"
+    warn "【重要安全警告】当前登录会话不会断开！"
+    warn "在关闭此终端前，请务必【新开一个窗口】测试能否通过新端口登录："
+    warn "👉 ssh -p ${target_port} $(whoami)@<您的服务器IP>"
+    echo -e "${GREEN}================================================================${PLAIN}"
+    echo ""
+}
+
+CURRENT_PORT=$(detect_ssh_port)
+SSH_PORT="$CURRENT_PORT"
+
+# 3. 询问是否修改 SSH 端口与确认最终端口
 if [[ -n "$CUSTOM_PORT" ]]; then
     if [[ "$CUSTOM_PORT" =~ ^[0-9]+$ ]] && [ "$CUSTOM_PORT" -ge 1 ] && [ "$CUSTOM_PORT" -le 65535 ]; then
-        SSH_PORT="$CUSTOM_PORT"
-        info "使用命令行指定的 SSH 端口: $SSH_PORT"
+        if [[ "$CUSTOM_PORT" != "$CURRENT_PORT" ]]; then
+            info "检测到命令行指定了新端口: $CUSTOM_PORT (当前为: $CURRENT_PORT)，正在执行更改..."
+            change_ssh_port "$CUSTOM_PORT"
+            SSH_PORT="$CUSTOM_PORT"
+        else
+            info "命令行指定端口与当前运行端口一致 ($CUSTOM_PORT)，无需修改 SSH 配置。"
+            SSH_PORT="$CUSTOM_PORT"
+        fi
     else
         err "命令行指定的端口号无效: $CUSTOM_PORT (必须为 1-65535 的整数)"
         exit 1
     fi
 elif [[ "$NON_INTERACTIVE" == "true" ]]; then
-    SSH_PORT="$DETECTED_PORT"
-    info "非交互模式，使用自动检测到的 SSH 端口: $SSH_PORT"
+    info "非交互模式，保持当前 SSH 端口: $SSH_PORT"
 else
-    # 交互模式：向用户提示并询问端口
+    # 交互模式：先提示当前端口，并询问是否修改
     input_source="/dev/stdin"
     if [[ -r "/dev/tty" && -c "/dev/tty" ]]; then
         input_source="/dev/tty"
     fi
 
     echo ""
-    echo -e "${YELLOW}----------------------------------------------------${PLAIN}"
-    echo -e "${YELLOW}[?] 请确认需要 Fail2Ban 防护的 SSH 端口${PLAIN}"
-    echo -e "    自动检测到当前服务器 SSH 端口为: ${GREEN}${DETECTED_PORT}${PLAIN}"
-    echo -e "${YELLOW}----------------------------------------------------${PLAIN}"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "${CYAN}[*] 当前检测到本机 SSH 监听端口为: ${GREEN}${CURRENT_PORT}${PLAIN}"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
 
     while true; do
-        echo -en "请输入 SSH 端口 [直接回车使用默认: ${GREEN}${DETECTED_PORT}${PLAIN}]: "
-        USER_INPUT=""
-        read -r USER_INPUT < "$input_source" || USER_INPUT=""
-        
-        # 用户直接按回车，采用自动检测到的端口
-        if [[ -z "${USER_INPUT// /}" ]]; then
-            SSH_PORT="$DETECTED_PORT"
-            break
-        fi
+        echo -en "是否需要修改本机 SSH 端口？[y/N] (直接回车默认不修改): "
+        CHANGE_CHOICE=""
+        read -r CHANGE_CHOICE < "$input_source" || CHANGE_CHOICE=""
+        CHANGE_CHOICE=$(echo "${CHANGE_CHOICE:-n}" | tr '[:upper:]' '[:lower:]')
 
-        # 校验用户输入的端口号
-        if [[ "$USER_INPUT" =~ ^[0-9]+$ ]] && [ "$USER_INPUT" -ge 1 ] && [ "$USER_INPUT" -le 65535 ]; then
-            SSH_PORT="$USER_INPUT"
+        if [[ "$CHANGE_CHOICE" == "y" || "$CHANGE_CHOICE" == "yes" ]]; then
+            while true; do
+                echo -en "请输入新的 SSH 端口号 [建议范围 1025-65534]: "
+                NEW_PORT_INPUT=""
+                read -r NEW_PORT_INPUT < "$input_source" || NEW_PORT_INPUT=""
+
+                if [[ "$NEW_PORT_INPUT" =~ ^[0-9]+$ ]] && [ "$NEW_PORT_INPUT" -ge 1 ] && [ "$NEW_PORT_INPUT" -le 65535 ]; then
+                    if [[ "$NEW_PORT_INPUT" == "$CURRENT_PORT" ]]; then
+                        warn "输入的端口与当前端口相同 ($CURRENT_PORT)，无需修改。"
+                        SSH_PORT="$CURRENT_PORT"
+                        break
+                    fi
+                    change_ssh_port "$NEW_PORT_INPUT"
+                    SSH_PORT="$NEW_PORT_INPUT"
+                    break
+                else
+                    err "端口号无效！请输入 1 到 65535 之间的纯数字。"
+                fi
+            done
+            break
+        elif [[ "$CHANGE_CHOICE" == "n" || "$CHANGE_CHOICE" == "no" || -z "$CHANGE_CHOICE" ]]; then
+            ok "保持原 SSH 端口不变: $SSH_PORT"
             break
         else
-            err "端口号无效！请输入 1 到 65535 之间的纯数字。"
+            err "输入错误，请仅输入 y 或 n！"
         fi
     done
-    ok "已确定防护 SSH 端口为: $SSH_PORT"
     echo ""
 fi
 
@@ -251,7 +353,6 @@ if [[ -n "$CLIENT_IP" && "$CLIENT_IP" != "127.0.0.1" ]]; then
     info "已将您当前连接的客户端 IP ($CLIENT_IP) 加入白名单，防止误封！"
 fi
 if [[ -n "$CUSTOM_WHITELIST" ]]; then
-    # 将逗号替换为空格
     SANITIZED_WHITELIST=$(echo "$CUSTOM_WHITELIST" | tr ',' ' ')
     IGNORE_IPS="$IGNORE_IPS $SANITIZED_WHITELIST"
     info "已追加指定白名单: $SANITIZED_WHITELIST"
@@ -269,7 +370,6 @@ fi
 # 智能检测后端日志模式（检查 systemd 与 python-systemd 支持）
 BACKEND="systemd"
 if command -v python3 >/dev/null 2>&1 && ! python3 -c 'import systemd' >/dev/null 2>&1; then
-    # 未检测到 python systemd 模块，回退到 auto
     BACKEND="auto"
 elif ! command -v journalctl >/dev/null 2>&1; then
     BACKEND="auto"
